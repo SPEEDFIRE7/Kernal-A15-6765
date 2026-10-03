@@ -1,0 +1,391 @@
+name: Fill Missing Files from Realme C11 + Build Kernel 4.9 (Oppo A15)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "مستودع Oppo A15 (يقبل رابط tree/ كاملاً)"
+        required: true
+        default: "https://github.com/oppo-source/A15"
+      kernel_branch:
+        description: "الفرع"
+        required: true
+        default: "main"
+      kernel_subdir:
+        description: "مجلد النواة داخل المستودع"
+        required: false
+        default: "kernel-4.9"
+      donor_repo:
+        description: "مستودع Realme C11 (المصدر الكامل)"
+        required: true
+        default: "https://github.com/Irawans-Android-Lab/android_kernel_realme_mt6765"
+      donor_branch:
+        description: "فرع Realme (اتركه فارغاً للافتراضي)"
+        required: false
+        default: ""
+      defconfig:
+        description: "defconfig"
+        required: true
+        default: "oppo6765_defconfig"
+      skip_patterns:
+        description: "مسارات يتم تخطيها بملفات وهمية (مفصولة بفاصلة)، مثل البصمة"
+        required: false
+        default: "fpc"
+      arch:
+        description: "المعمارية"
+        required: true
+        default: "arm64"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: توسيع المساحة
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: تثبيت الأدوات
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses-dev cpio python3 git lz4 zstd device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: جلب سورس Oppo A15
+        env:
+          IN_REPO: ${{ inputs.kernel_repo }}
+          IN_BRANCH: ${{ inputs.kernel_branch }}
+          IN_SUB: ${{ inputs.kernel_subdir }}
+        run: |
+          mkdir -p reports
+          REPO="${IN_REPO%/}"; BRANCH="$IN_BRANCH"; SUB="$IN_SUB"
+          if [[ "$REPO" == */tree/* ]]; then
+            REST="${REPO#*/tree/}"
+            REPO="${REPO%%/tree/*}"
+            BRANCH="${REST%%/*}"
+            [[ "$REST" == */* ]] && SUB="${REST#*/}"
+          fi
+          echo "REPO=$REPO BRANCH=$BRANCH SUB=$SUB"
+          if [ -n "$SUB" ]; then
+            git clone --depth=1 --filter=blob:none --sparse -b "$BRANCH" "$REPO" repo
+            git -C repo sparse-checkout set "$SUB"
+            [ -d "repo/$SUB" ] || { echo "::error::المجلد $SUB غير موجود"; ls repo; exit 1; }
+            mv "repo/$SUB" kernel
+          else
+            git clone --depth=1 -b "$BRANCH" "$REPO" kernel
+          fi
+
+      - name: جلب سورس Realme C11 (المصدر المانح)
+        env:
+          IN_DONOR: ${{ inputs.donor_repo }}
+          IN_DBRANCH: ${{ inputs.donor_branch }}
+        run: |
+          DREPO="${IN_DONOR%/}"
+          if [ -n "$IN_DBRANCH" ]; then
+            git clone --depth=1 -b "$IN_DBRANCH" "$DREPO" donor_repo
+          else
+            git clone --depth=1 "$DREPO" donor_repo
+          fi
+          # اكتشاف جذر النواة تلقائياً (المجلد الذي يحوي init/main.c)
+          MAIN=$(find donor_repo -maxdepth 4 -path '*/init/main.c' -not -path '*/.git/*' | head -n1)
+          [ -n "$MAIN" ] || { echo "::error::لم أجد جذر النواة في مستودع Realme"; ls donor_repo; exit 1; }
+          DONOR_DIR=$(realpath "$(dirname "$(dirname "$MAIN")")")
+          echo "DONOR_DIR=$DONOR_DIR" >> "$GITHUB_ENV"
+          echo "جذر النواة المانحة: $DONOR_DIR"
+          df -h /
+
+      - name: كتابة سكربت الترقيع
+        run: |
+          cat > fill.py <<'PY'
+          import os, re, shutil, subprocess, sys
+
+          K = os.path.abspath("kernel")
+          D = os.environ["DONOR_DIR"]
+          SKIP = [s.strip() for s in os.environ.get("SKIP_PATTERNS", "").split(",") if s.strip()]
+          ARCH = os.environ.get("ARCH_IN", "arm64")
+          DEFCONFIG = os.environ["DEFCONFIG"]
+          REP = os.path.abspath("reports")
+          ADDED = os.path.abspath("added_from_donor")
+          os.makedirs(REP, exist_ok=True)
+          os.makedirs(ADDED, exist_ok=True)
+          LOG = os.path.join(REP, "fill_actions.txt")
+
+
+          def log(msg):
+              print(msg, flush=True)
+              with open(LOG, "a") as f:
+                  f.write(msg + "\n")
+
+
+          def is_skipped(rel):
+              return any(s in rel for s in SKIP)
+
+
+          def copy_one(relf):
+              s = os.path.join(D, relf)
+              d = os.path.join(K, relf)
+              if os.path.exists(d):
+                  return 0
+              os.makedirs(os.path.dirname(d), exist_ok=True)
+              shutil.copy2(s, d)
+              a = os.path.join(ADDED, relf)
+              os.makedirs(os.path.dirname(a), exist_ok=True)
+              shutil.copy2(s, a)
+              return 1
+
+
+          def fill(rel):
+              """ينسخ الملفات الناقصة فقط من المصدر المانح (لا يستبدل شيئاً موجوداً)."""
+              rel = os.path.normpath(rel)
+              if rel.startswith("..") or rel == ".":
+                  return False
+              if is_skipped(rel):
+                  base = os.path.basename(rel)
+                  is_file = (base.startswith("Kconfig") or base == "Makefile"
+                             or os.path.splitext(base)[1] in (".c", ".h", ".S", ".o"))
+                  d = os.path.dirname(rel) if is_file else rel
+                  os.makedirs(os.path.join(K, d), exist_ok=True)
+                  made = False
+                  for f in ("Makefile", "Kconfig"):
+                      fp = os.path.join(K, d, f)
+                      if not os.path.exists(fp):
+                          with open(fp, "w") as o:
+                              o.write("# stub (skipped on purpose)\n")
+                          made = True
+                  if made:
+                      log("STUB: " + d)
+                  return made
+              src = os.path.join(D, rel)
+              if not os.path.exists(src):
+                  log("NOTFOUND: " + rel)
+                  return False
+              n = 0
+              if os.path.isdir(src):
+                  for r, ds, fs in os.walk(src):
+                      ds[:] = [x for x in ds if x != ".git"]
+                      for f in fs:
+                          n += copy_one(os.path.relpath(os.path.join(r, f), D))
+              else:
+                  n = copy_one(rel)
+              if n:
+                  log("COPIED: %s (%d files)" % (rel, n))
+              return n > 0
+
+
+          def make(args, out_log):
+              env = dict(os.environ, ARCH=ARCH, CROSS_COMPILE="aarch64-linux-gnu-",
+                         CROSS_COMPILE_ARM32="arm-linux-gnueabi-")
+              p = subprocess.run(["make", "O=out"] + args, cwd=K, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, errors="replace")
+              with open(out_log, "w") as f:
+                  f.write(p.stdout)
+              return p.returncode, p.stdout
+
+
+          # ---------- المرحلة A: Kconfig / defconfig ----------
+          def cmd_config():
+              for i in range(1, 40):
+                  rc, txt = make([DEFCONFIG], os.path.join(REP, "02_defconfig.log"))
+                  if rc == 0 and os.path.exists(os.path.join(K, "out", ".config")):
+                      log("INFO: defconfig OK after %d round(s)" % i)
+                      return
+                  miss = list(dict.fromkeys(re.findall(r"can't open file \"([^\"]+)\"", txt)))
+                  if not miss:
+                      log("INFO: defconfig failed with no missing file detected; see 02_defconfig.log")
+                      return
+                  progress = False
+                  for m in miss:
+                      d = os.path.dirname(m)
+                      if d and not os.path.isdir(os.path.join(K, d)):
+                          progress |= fill(d)
+                      else:
+                          progress |= fill(m)
+                  if not progress:
+                      log("INFO: could not resolve Kconfig errors from donor; see NOTFOUND lines")
+                      return
+
+
+          # ---------- المرحلة B: Makefile بعد توفر .config ----------
+          def load_cfg():
+              cfg = set()
+              p = os.path.join(K, "out", ".config")
+              if os.path.exists(p):
+                  for l in open(p, errors="ignore"):
+                      m = re.match(r"(CONFIG_\w+)=[ym]", l)
+                      if m:
+                          cfg.add(m.group(1))
+              return cfg
+
+
+          def cmd_makefiles():
+              cfg = load_cfg()
+              if not cfg:
+                  log("INFO: no .config, makefile scan skipped")
+                  return
+              dirs_todo, srcs_todo = set(), set()
+              for root, dirs, files in os.walk(K):
+                  rr = os.path.relpath(root, K)
+                  dirs[:] = [d for d in dirs if d not in (".git", "out", "Documentation")]
+                  if rr == "arch":
+                      dirs[:] = [d for d in dirs if d in ("arm64", "arm")]
+                  for mk in ("Makefile", "Kbuild"):
+                      if mk not in files:
+                          continue
+                      txt = open(os.path.join(root, mk), errors="ignore").read().replace("\\\n", " ")
+                      comps = set(re.findall(r"^([\w\-]+)-(?:objs|y|m)\s*[:+]?=", txt, re.M))
+                      for m in re.finditer(r"^obj-(y|m|\$\((CONFIG_\w+)\))\s*[:+]?=\s*(.*)$", txt, re.M):
+                          sym = m.group(2)
+                          if sym and sym not in cfg:
+                              continue
+                          for tok in m.group(3).split("#")[0].split():
+                              if "$" in tok or '"' in tok or tok.startswith("-"):
+                                  continue
+                              rel = os.path.normpath(os.path.join(rr, tok))
+                              if tok.endswith("/"):
+                                  if not os.path.isdir(os.path.join(K, rel)):
+                                      dirs_todo.add(rel)
+                              elif tok.endswith(".o"):
+                                  base = rel[:-2]
+                                  if os.path.basename(base) in comps:
+                                      continue
+                                  if any(os.path.exists(os.path.join(K, base + e))
+                                         for e in (".c", ".S", ".s", ".o_shipped", ".c_shipped")):
+                                      continue
+                                  srcs_todo.add(base)
+              for rel in sorted(dirs_todo):
+                  fill(rel)
+              for base in sorted(srcs_todo):
+                  for e in (".c", ".S"):
+                      if os.path.exists(os.path.join(D, base + e)):
+                          fill(base + e)
+                          break
+                  else:
+                      log("NOTFOUND: " + base + ".c")
+
+
+          # ---------- المرحلة C: البناء مع ترقيع الأخطاء ----------
+          def index_donor():
+              idx = {}
+              for r, ds, fs in os.walk(D):
+                  ds[:] = [x for x in ds if x != ".git"]
+                  for f in fs:
+                      idx.setdefault(f, []).append(os.path.relpath(os.path.join(r, f), D))
+              return idx
+
+
+          def cmd_build():
+              idx = index_donor()
+              for i in range(1, 5):
+                  log("INFO: build round %d" % i)
+                  rc, txt = make(["-k", "-j%d" % (os.cpu_count() or 2)], os.path.join(REP, "04_build.log"))
+                  changed = False
+                  for h in sorted(set(re.findall(r"fatal error: ([^\s:]+): No such file or directory", txt))):
+                      cands = [p for p in idx.get(os.path.basename(h), []) if p == h or p.endswith("/" + h)]
+                      if not cands:
+                          log("NOTFOUND: header " + h)
+                          continue
+                      cands.sort(key=len)
+                      changed |= fill(cands[0])
+                  for t in sorted(set(re.findall(r"No rule to make target '([^']+)'", txt))):
+                      if "/" not in t or t.startswith(("include/config", "include/generated", "out/")):
+                          continue
+                      if t.endswith(".o"):
+                          for e in (".c", ".S"):
+                              if os.path.exists(os.path.join(D, t[:-2] + e)):
+                                  changed |= fill(t[:-2] + e)
+                                  break
+                          else:
+                              log("NOTFOUND: " + t)
+                      else:
+                          changed |= fill(t)
+                  if rc == 0:
+                      log("INFO: build finished successfully")
+                      break
+                  if not changed:
+                      log("INFO: no more files can be filled from donor; stopping")
+                      break
+
+
+          {"config": cmd_config, "makefiles": cmd_makefiles, "build": cmd_build}[sys.argv[1]]()
+          PY
+          python3 -m py_compile fill.py && echo "script OK"
+
+      - name: المرحلة A - ترقيع Kconfig / defconfig
+        continue-on-error: true
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          ARCH_IN: ${{ inputs.arch }}
+          SKIP_PATTERNS: ${{ inputs.skip_patterns }}
+        run: python3 fill.py config
+
+      - name: المرحلة B - ترقيع مجلدات وملفات Makefile
+        continue-on-error: true
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          ARCH_IN: ${{ inputs.arch }}
+          SKIP_PATTERNS: ${{ inputs.skip_patterns }}
+        run: python3 fill.py makefiles
+
+      - name: المرحلة C - بناء النواة مع ترقيع الأخطاء
+        continue-on-error: true
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          ARCH_IN: ${{ inputs.arch }}
+          SKIP_PATTERNS: ${{ inputs.skip_patterns }}
+        run: python3 fill.py build
+
+      - name: تقرير نهائي
+        if: always()
+        run: |
+          mkdir -p reports added_from_donor
+          F=reports/FILL_REPORT.txt
+          {
+            echo "########## تقرير الترقيع من Realme C11 ##########"
+            echo
+            echo "== 1) ملفات/مجلدات نُسخت من Realme (أضِفها لمستودعك) =="
+            grep '^COPIED' reports/fill_actions.txt 2>/dev/null | sort -u
+            echo
+            echo "== 2) مجلدات وهمية (تم تخطيها عمداً) =="
+            grep '^STUB' reports/fill_actions.txt 2>/dev/null | sort -u
+            echo
+            echo "== 3) غير موجودة حتى في Realme (تحتاج مصدراً آخر) =="
+            grep '^NOTFOUND' reports/fill_actions.txt 2>/dev/null | sort -u
+            echo
+            echo "== 4) حالة المراحل =="
+            grep '^INFO' reports/fill_actions.txt 2>/dev/null
+            echo
+            echo "== 5) أخطاء البناء المتبقية =="
+            grep -E "error:|No rule to make target|No such file|can't open" reports/04_build.log 2>/dev/null | sort -u | head -n 80
+            grep -E "can't open" reports/02_defconfig.log 2>/dev/null | sort -u
+          } > "$F"
+          cat "$F"
+          cat "$F" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: رفع التقارير
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fill-report
+          path: reports/
+
+      - name: رفع الملفات المنسوخة من Realme (بنفس بنية المجلدات)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: added-from-realme
+          path: added_from_donor/
+          if-no-files-found: ignore
+
+      - name: رفع النواة (إن نجح البناء)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-output
+          path: |
+            kernel/out/arch/${{ inputs.arch }}/boot/Image*
+            kernel/out/arch/${{ inputs.arch }}/boot/dts/**/*.dtb
+          if-no-files-found: ignore
