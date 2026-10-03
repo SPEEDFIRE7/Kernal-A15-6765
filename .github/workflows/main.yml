@@ -42,19 +42,31 @@ jobs:
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
       - name: جلب السورس
+        env:
+          IN_REPO: ${{ inputs.kernel_repo }}
+          IN_BRANCH: ${{ inputs.kernel_branch }}
+          IN_SUB: ${{ inputs.kernel_subdir }}
         run: |
-          SUB="${{ inputs.kernel_subdir }}"
+          mkdir -p reports
+          REPO="${IN_REPO%/}"; BRANCH="$IN_BRANCH"; SUB="$IN_SUB"
+          # دعم لصق رابط tree/ كامل: يتم استخراج المستودع والفرع والمجلد تلقائياً
+          if [[ "$REPO" == */tree/* ]]; then
+            REST="${REPO#*/tree/}"
+            REPO="${REPO%%/tree/*}"
+            BRANCH="${REST%%/*}"
+            [[ "$REST" == */* ]] && SUB="${REST#*/}"
+          fi
+          echo "REPO=$REPO BRANCH=$BRANCH SUB=$SUB"
           if [ -n "$SUB" ]; then
-            git clone --depth=1 --filter=blob:none --sparse -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" repo
+            git clone --depth=1 --filter=blob:none --sparse -b "$BRANCH" "$REPO" repo
             git -C repo sparse-checkout set "$SUB"
             if [ ! -d "repo/$SUB" ]; then
               echo "::error::المجلد $SUB غير موجود في المستودع"; ls repo; exit 1
             fi
             mv "repo/$SUB" kernel
           else
-            git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
+            git clone --depth=1 -b "$BRANCH" "$REPO" kernel
           fi
-          mkdir -p reports
 
       # ---------- المرحلة 1: فحص الملفات الأساسية ----------
       - name: فحص الملفات الأساسية
@@ -160,6 +172,7 @@ jobs:
       - name: تجميع تقرير الملفات المفقودة
         if: always()
         run: |
+          mkdir -p reports
           L=reports/04_build.log
           F=reports/MISSING_FILES_REPORT.txt
           {
