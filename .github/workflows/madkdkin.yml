@@ -1,0 +1,80 @@
+name: Repack boot.img (kernel من تشغيل سابق)
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: "رابط boot.img الأصلي"
+        required: true
+        default: "https://pixeldrain.com/u/LhQvAP8z"
+      run_id:
+        description: "رقم التشغيل الذي بنى النواة (الرقم في رابط run)"
+        required: true
+        default: "37220964712"
+      kernel_image:
+        description: "ملف النواة الذي يوضع داخل boot.img"
+        required: true
+        type: choice
+        options:
+          - Image.gz-dtb
+          - Image.gz
+          - Image
+        default: "Image.gz-dtb"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  repack:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: تنزيل النواة من التشغيل السابق
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-output
+          path: kernel-output
+          run-id: ${{ inputs.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: عرض محتوى النواة
+        run: ls -lR kernel-output | head -n 40
+
+      - name: تنزيل boot.img وأداة magiskboot
+        env:
+          BOOT_URL: ${{ inputs.boot_img_url }}
+        run: |
+          mkdir -p work && cd work
+          URL="$BOOT_URL"
+          if [[ "$URL" =~ pixeldrain\.com/u/([A-Za-z0-9_-]+) ]]; then
+            URL="https://pixeldrain.com/api/file/${BASH_REMATCH[1]}"
+          fi
+          echo "تحميل boot.img من: $URL"
+          curl -L --fail --retry 3 -o boot.img "$URL"
+          ls -l boot.img; file boot.img
+          curl -L --fail --retry 3 -o magisk.apk https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk
+          unzip -o -j magisk.apk lib/x86_64/libmagiskboot.so -d .
+          mv libmagiskboot.so magiskboot && chmod +x magiskboot
+
+      - name: فك boot.img واستبدال النواة وإعادة التجميع
+        env:
+          KIMG: ${{ inputs.kernel_image }}
+        run: |
+          cd work
+          [ -f "../kernel-output/$KIMG" ] || { echo "::error::الملف $KIMG غير موجود في kernel-output"; exit 1; }
+          ./magiskboot unpack boot.img 2>&1 | tee unpack.log
+          echo "--- محتوى المجلد بعد الفك ---"; ls -l
+          cp "../kernel-output/$KIMG" kernel
+          ./magiskboot repack boot.img new-boot.img 2>&1 | tee repack.log
+          ls -l boot.img new-boot.img
+          mkdir -p ../out
+          cp new-boot.img unpack.log repack.log ../out/
+
+      - name: رفع النتيجة
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-boot-img
+          path: out/
+          if-no-files-found: ignore
