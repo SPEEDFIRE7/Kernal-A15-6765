@@ -1,0 +1,332 @@
+name: Build Kernel 4.9 - Oppo A15 (Missing Files Detectoooooor)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "رابط المستودع"
+        required: true
+        default: "https://github.com/oppo-source/A15"
+      kernel_branch:
+        description: "الفرع"
+        required: true
+        default: "main"
+      kernel_subdir:
+        description: "مجلد النواة داخل المستودع (اتركه فارغاً إن كان في الجذر)"
+        required: false
+        default: "kernel-4.9"
+      defconfig:
+        description: "اسم ملف defconfig (مثال: xxx_defconfig)"
+        required: true
+      arch:
+        description: "المعمارية"
+        required: true
+        default: "arm64"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: توسيع المساحة
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: تثبيت الأدوات
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses-dev cpio python3 git ccache lz4 zstd device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi python2 gcc-9
+
+      - name: جلب السورس
+        env:
+          IN_REPO: ${{ inputs.kernel_repo }}
+          IN_BRANCH: ${{ inputs.kernel_branch }}
+          IN_SUB: ${{ inputs.kernel_subdir }}
+        run: |
+          mkdir -p reports
+          REPO="${IN_REPO%/}"; BRANCH="$IN_BRANCH"; SUB="$IN_SUB"
+          # دعم لصق رابط tree/ كامل: يتم استخراج المستودع والفرع والمجلد تلقائياً
+          if [[ "$REPO" == */tree/* ]]; then
+            REST="${REPO#*/tree/}"
+            REPO="${REPO%%/tree/*}"
+            BRANCH="${REST%%/*}"
+            [[ "$REST" == */* ]] && SUB="${REST#*/}"
+          fi
+          echo "REPO=$REPO BRANCH=$BRANCH SUB=$SUB"
+          if [ -n "$SUB" ]; then
+            git clone --depth=1 --filter=blob:none --sparse -b "$BRANCH" "$REPO" repo
+            git -C repo sparse-checkout set "$SUB"
+            if [ ! -d "repo/$SUB" ]; then
+              echo "::error::المجلد $SUB غير موجود في المستودع"; ls repo; exit 1
+            fi
+            mv "repo/$SUB" kernel
+          else
+            git clone --depth=1 -b "$BRANCH" "$REPO" kernel
+          fi
+
+      - name: تجهيز Python2 لأدوات MediaTek (DrvGen.py)
+        working-directory: kernel
+        run: |
+          sudo ln -sf /usr/bin/python2 /usr/local/bin/python
+          python --version || true
+          # أدوات DCT مكتوبة بـ Python 2: نثبّت المفسّر في السطر الأول
+          for f in tools/dct/*.py; do
+            [ -f "$f" ] && sed -i '1s|^#!.*python.*$|#!/usr/bin/python2|' "$f"
+          done
+          chmod +x tools/dct/*.py 2>/dev/null || true
+          head -n1 tools/dct/DrvGen.py 2>/dev/null || true
+
+      - name: ترقيع تعارض fw_entry (تعريف مكرر بين شاشة اللمس وWiFi)
+        working-directory: kernel
+        run: |
+          F=drivers/input/touchscreen/mediatek/NT36525B/nt36xxx_fw_update.c
+          echo "--- قبل ---"; sed -n '40,44p' "$F"
+          grep -rn "fw_entry" drivers/input/touchscreen/mediatek/NT36525B/*.h || true
+          sed -i -E '42s/^([[:space:]]*)(const[[:space:]]+struct[[:space:]]+firmware[[:space:]]*\*[[:space:]]*fw_entry)/\1static \2/' "$F"
+          echo "--- بعد ---"; sed -n '40,44p' "$F"
+
+      # ---------- المرحلة 1: فحص الملفات الأساسية ----------
+      - name: فحص الملفات الأساسية
+        working-directory: kernel
+        run: |
+          R=../reports/01_core_missing.txt
+          : > "$R"
+          ARCH="${{ inputs.arch }}"
+          for f in Makefile Kconfig init/main.c "arch/$ARCH/Makefile" "arch/$ARCH/Kconfig" \
+                   "arch/$ARCH/configs/${{ inputs.defconfig }}" scripts/kconfig/Makefile; do
+            [ -e "$f" ] || echo "MISSING_CORE: $f" >> "$R"
+          done
+          if [ ! -e "arch/$ARCH/configs/${{ inputs.defconfig }}" ]; then
+            echo "--- defconfigs المتوفرة في السورس ---" >> "$R"
+            ls "arch/$ARCH/configs/" 2>/dev/null >> "$R" || echo "(المجلد غير موجود)" >> "$R"
+          fi
+          cat "$R"
+
+      # ---------- المرحلة 2: توليد .config ----------
+      - name: make defconfig
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          export ARCH=${{ inputs.arch }} CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          make O=out HOSTCC=gcc-9 ${{ inputs.defconfig }} 2>&1 | tee ../reports/02_defconfig.log
+
+      # ---------- المرحلة 3: فحص Kconfig و Makefile ----------
+      - name: فحص Kconfig و Makefile (ملفات مفقودة)
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          cfg = {}
+          p = "out/.config"
+          if os.path.exists(p):
+              for l in open(p, errors="ignore"):
+                  m = re.match(r"(CONFIG_\w+)=([ym])", l)
+                  if m: cfg[m.group(1)] = m.group(2)
+          have_cfg = bool(cfg)
+
+          missing_kconfig, missing_objs, missing_dirs = [], [], []
+
+          for root, dirs, files in os.walk("."):
+              if root.startswith("./out") or "/.git" in root:
+                  continue
+
+              # --- Kconfig: source "path" ---
+              for f in files:
+                  if f.startswith("Kconfig"):
+                      fp = os.path.join(root, f)
+                      for l in open(fp, errors="ignore"):
+                          m = re.match(r'\s*source\s+"?([^"\s]+)"?', l)
+                          if m and "$" not in m.group(1):
+                              if not os.path.exists(m.group(1)):
+                                  missing_kconfig.append(f"{fp} -> {m.group(1)}")
+
+              # --- Makefile: obj-y / obj-m ---
+              for mk in ("Makefile", "Kbuild"):
+                  if mk not in files:
+                      continue
+                  fp = os.path.join(root, mk)
+                  txt = open(fp, errors="ignore").read().replace("\\\n", " ")
+                  composites = set(re.findall(r"^([\w\-]+)-(?:objs|y|m)\s*[:+]?=", txt, re.M))
+                  for m in re.finditer(r"^obj-(y|m|\$\((CONFIG_\w+)\))\s*[:+]?=\s*(.*)$", txt, re.M):
+                      sym = m.group(2)
+                      if sym and have_cfg and sym not in cfg:
+                          continue  # غير مفعّل في defconfig
+                      for tok in m.group(3).split("#")[0].split():
+                          if "$" in tok:
+                              continue
+                          if tok.endswith("/"):
+                              if not os.path.isdir(os.path.join(root, tok)):
+                                  missing_dirs.append(f"{fp} -> {tok}")
+                          elif tok.endswith(".o"):
+                              base = tok[:-2]
+                              if base in composites:
+                                  continue
+                              if not any(os.path.exists(os.path.join(root, base + e))
+                                         for e in (".c", ".S", ".s", ".o_shipped", ".c_shipped")):
+                                  missing_objs.append(f"{fp} -> {base}.c (أو .S)")
+
+          with open("../reports/03_static_missing.txt", "w") as o:
+              o.write("== Kconfig: ملفات source مفقودة ==\n" + "\n".join(sorted(set(missing_kconfig))) + "\n\n")
+              o.write("== Makefile: مجلدات مفقودة ==\n" + "\n".join(sorted(set(missing_dirs))) + "\n\n")
+              o.write("== Makefile: ملفات مصدرية مفقودة ==\n" + "\n".join(sorted(set(missing_objs))) + "\n")
+              if not have_cfg:
+                  o.write("\n[تنبيه] لم يتم توليد .config، لذلك تم فحص كل الخيارات (قد تظهر نتائج زائدة).\n")
+          print(open("../reports/03_static_missing.txt").read())
+          PY
+
+      # ---------- المرحلة 4: البناء مع -k لجمع كل الأخطاء ----------
+      - name: بناء النواة (يكمل رغم الأخطاء)
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          export ARCH=${{ inputs.arch }} CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          [ -f out/.config ] || make O=out HOSTCC=gcc-9 ${{ inputs.defconfig }} || true
+          make O=out HOSTCC=gcc-9 -k -j$(nproc) 2>&1 | tee ../reports/04_build.log
+
+      # ---------- المرحلة 5: استخراج الملفات المفقودة من لوج البناء ----------
+      # ---------- المرحلة 4ب: ترقيع تعارضات الربط (multiple definition) تلقائياً ----------
+      - name: ترقيع تعارضات الربط وإعادة الربط
+        continue-on-error: true
+        env:
+          ARCH_IN: ${{ inputs.arch }}
+        run: |
+          cat > linkfix.py <<'PY'
+          import os, re, shutil, subprocess
+
+          K = os.path.abspath("kernel")
+          REP = os.path.abspath("reports")
+          PATCHED = os.path.abspath("patched_files")
+          LOG = os.path.join(REP, "05_link_fix.log")
+          ENV = dict(os.environ, ARCH=os.environ.get("ARCH_IN", "arm64"),
+                     CROSS_COMPILE="aarch64-linux-gnu-", CROSS_COMPILE_ARM32="arm-linux-gnueabi-")
+          PAT = re.compile(r"(\S+?\.c):(\d+): multiple definition of `(\w+)'; \S+?:(\S+?\.c):(\d+): first defined here")
+
+
+          def log(m):
+              print(m, flush=True)
+              with open(LOG, "a") as f:
+                  f.write(m + "\n")
+
+
+          def norm(p):
+              return p.split("out/../")[-1]
+
+
+          def extern_use(sym):
+              r = subprocess.run(["grep", "-rnE", r"extern[^;]*\b%s\b" % sym, "--include=*.h", "--include=*.c", "."],
+                                 cwd=K, capture_output=True, text=True, errors="replace")
+              return r.stdout.strip()
+
+
+          def make_static(rel, line, sym):
+              fp = os.path.join(K, rel)
+              if not os.path.exists(fp):
+                  return False
+              L = open(fp, encoding="latin-1").read().split("\n")
+              s = L[line - 1]
+              if sym not in s or re.match(r"\s*(static|extern)\b", s):
+                  return False
+              L[line - 1] = re.sub(r"^(\s*)", r"\1static ", s, count=1)
+              open(fp, "w", encoding="latin-1").write("\n".join(L))
+              dst = os.path.join(PATCHED, rel)
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              shutil.copy2(fp, dst)
+              log("PATCHED: %s:%d  [%s]  ->  %s" % (rel, line, sym, L[line - 1].strip()))
+              return True
+
+
+          for i in range(1, 16):
+              log("INFO: link round %d" % i)
+              p = subprocess.run(["make", "O=out", "HOSTCC=gcc-9", "-j%d" % (os.cpu_count() or 2)],
+                                 cwd=K, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, errors="replace")
+              txt = p.stdout
+              open(os.path.join(REP, "06_last_link.log"), "w").write(txt)
+              if p.returncode == 0:
+                  log("INFO: build + link SUCCEEDED")
+                  break
+              ms = PAT.findall(txt)
+              if not ms:
+                  log("INFO: failed with a different error (not multiple definition); see 06_last_link.log")
+                  log("TAIL: " + " | ".join(txt.strip().split("\n")[-6:])[:1500])
+                  break
+              changed = False
+              for f1, l1, sym, f2, l2 in ms:
+                  ex = extern_use(sym)
+                  if ex:
+                      log("SKIP: %s is used with extern elsewhere, patch manually: %s" % (sym, ex.split("\n")[0]))
+                      continue
+                  for rel, ln in ((norm(f1), int(l1)), (norm(f2), int(l2))):
+                      if make_static(rel, ln, sym):
+                          changed = True
+                          break
+              if not changed:
+                  log("INFO: no more automatic patches possible")
+                  break
+          PY
+          python3 linkfix.py
+
+      - name: تجميع تقرير الملفات المفقودة
+        if: always()
+        run: |
+          mkdir -p reports
+          L=reports/04_build.log
+          F=reports/MISSING_FILES_REPORT.txt
+          {
+            echo "########## تقرير الملفات الناقصة ##########"
+            echo
+            echo "== 1) ملفات أساسية مفقودة =="
+            cat reports/01_core_missing.txt 2>/dev/null
+            echo
+            echo "== 2) فحص ثابت (Kconfig/Makefile) =="
+            cat reports/03_static_missing.txt 2>/dev/null
+            echo
+            echo "== 3) ملفات Header مفقودة (من البناء) =="
+            grep -oE "fatal error: [^:]+: No such file or directory" "$L" 2>/dev/null | sort | uniq -c | sort -rn
+            echo
+            echo "== 4) 'No rule to make target' (ملف مفقود أو تبعية ناقصة) =="
+            grep -oE "No rule to make target '[^']+'" "$L" 2>/dev/null | sort -u
+            echo
+            echo "== 5) ملفات أخرى مفقودة =="
+            grep -E "No such file or directory|cannot find|can't open|Cannot open" "$L" 2>/dev/null \
+              | grep -v "fatal error" | sort -u | head -n 200
+            echo
+            echo "== 6) رموز غير معرّفة (undefined reference) =="
+            grep -oE "undefined reference to \`[^']+'" "$L" 2>/dev/null | sort | uniq -c | sort -rn | head -n 100
+            echo
+            echo "== 7) أول 50 خطأ بناء =="
+            grep -E "error:|Error [0-9]" "$L" 2>/dev/null | head -n 50
+          } > "$F"
+          cat "$F"
+          cat "$F" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: رفع التقارير
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: missing-files-report
+          path: reports/
+
+      - name: رفع الملفات المرقّعة (طبّقها على سورسك لتدوم)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-files
+          path: patched_files/
+          if-no-files-found: ignore
+
+      - name: رفع النواة (إن نجح البناء)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-output
+          path: |
+            kernel/out/arch/${{ inputs.arch }}/boot/Image*
+            kernel/out/arch/${{ inputs.arch }}/boot/dts/**/*.dtb
+          if-no-files-found: ignore
