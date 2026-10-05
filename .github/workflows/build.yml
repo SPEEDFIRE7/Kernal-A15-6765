@@ -31,7 +31,7 @@ jobs:
         mkdir -p tools
         
         echo "==> Cloning EviraKernel Clang 11... <=="
-        git clone https://github.com/EviraKernel/Clang-11 -b master --depth=1 tools/clang
+        git clone https://github.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-5407736 -b 9.0 --depth=1 tools/clang
         
         echo "==> Cloning GCC 64-bit... <=="
         git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 -b ndk-release-r16 --depth=1 tools/gcc64
