@@ -1,0 +1,215 @@
+name: Merge Realme C15 into Oppo A15 (Hybrid Source)
+
+on:
+  workflow_dispatch:
+    inputs:
+      a15_repo:
+        description: "مستودع سورس A15 (ضع هنا مستودعك المعدّل من صديقك إن وُجد). يقبل رابط tree/"
+        required: true
+        default: "https://github.com/oppo-source/A15"
+      a15_branch:
+        description: "الفرع"
+        required: true
+        default: "main"
+      a15_subdir:
+        description: "مجلد النواة داخل المستودع (اتركه فارغاً إن كانت في الجذر)"
+        required: false
+        default: "kernel-4.9"
+      donor_repo:
+        description: "مستودع سورس Realme C15 (المصدر الكامل)"
+        required: true
+        default: "https://github.com/Irawans-Android-Lab/android_kernel_realme_mt6765"
+      donor_branch:
+        description: "فرع Realme (اتركه فارغاً للافتراضي)"
+        required: false
+        default: ""
+      exclude_patterns:
+        description: "مسارات تُستثنى من الدمج، مفصولة بفواصل (مثال: fpc,arch/arm/*)"
+        required: false
+        default: ""
+      overwrite_paths:
+        description: "اختياري: مسارات تُستبدل بنسخة Realme حتى لو كانت موجودة (مثال: drivers/input/touchscreen/oppo_touchscreen)"
+        required: false
+        default: ""
+      target_repo:
+        description: "اختياري: مستودع فارغ تدفع إليه النتيجة مباشرة owner/repo (يتطلب سر PUSH_TOKEN)"
+        required: false
+        default: ""
+      target_branch:
+        description: "فرع المستودع الهدف"
+        required: false
+        default: "main"
+      publish_release:
+        description: "نشر الـ zip كـ Release في هذا المستودع (لا يستهلك حصة Artifacts)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: توسيع المساحة
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          command -v rsync >/dev/null || { sudo apt-get update && sudo apt-get install -y rsync; }
+          df -h /
+
+      - name: جلب سورس A15
+        env:
+          IN_REPO: ${{ inputs.a15_repo }}
+          IN_BRANCH: ${{ inputs.a15_branch }}
+          IN_SUB: ${{ inputs.a15_subdir }}
+        run: |
+          mkdir -p reports
+          REPO="${IN_REPO%/}"; BRANCH="$IN_BRANCH"; SUB="$IN_SUB"
+          if [[ "$REPO" == */tree/* ]]; then
+            REST="${REPO#*/tree/}"
+            REPO="${REPO%%/tree/*}"
+            BRANCH="${REST%%/*}"
+            [[ "$REST" == */* ]] && SUB="${REST#*/}"
+          fi
+          echo "REPO=$REPO BRANCH=$BRANCH SUB=$SUB"
+          if [ -n "$SUB" ]; then
+            git clone --depth=1 --filter=blob:none --sparse -b "$BRANCH" "$REPO" a15tmp
+            git -C a15tmp sparse-checkout set "$SUB"
+            [ -d "a15tmp/$SUB" ] || { echo "::error::المجلد $SUB غير موجود"; ls a15tmp; exit 1; }
+            mv "a15tmp/$SUB" hybrid
+          else
+            git clone --depth=1 -b "$BRANCH" "$REPO" hybrid
+          fi
+          rm -rf hybrid/.git a15tmp
+          echo "ملفات A15: $(find hybrid -type f | wc -l)"
+
+      - name: جلب سورس Realme C15
+        env:
+          IN_DONOR: ${{ inputs.donor_repo }}
+          IN_DBRANCH: ${{ inputs.donor_branch }}
+        run: |
+          DREPO="${IN_DONOR%/}"
+          if [ -n "$IN_DBRANCH" ]; then
+            git clone --depth=1 -b "$IN_DBRANCH" "$DREPO" donor_repo
+          else
+            git clone --depth=1 "$DREPO" donor_repo
+          fi
+          MAIN=$(find donor_repo -maxdepth 4 -path '*/init/main.c' -not -path '*/.git/*' | head -n1)
+          [ -n "$MAIN" ] || { echo "::error::لم أجد جذر النواة في مستودع Realme"; ls donor_repo; exit 1; }
+          DONOR_DIR=$(realpath "$(dirname "$(dirname "$MAIN")")")
+          echo "DONOR_DIR=$DONOR_DIR" >> "$GITHUB_ENV"
+          echo "جذر النواة المانحة: $DONOR_DIR"
+          echo "ملفات Realme: $(find "$DONOR_DIR" -type f -not -path '*/.git/*' | wc -l)"
+          df -h /
+
+      - name: دمج كل ما ينقص (بدون استبدال أي ملف موجود)
+        env:
+          EXCLUDE: ${{ inputs.exclude_patterns }}
+          OVERWRITE: ${{ inputs.overwrite_paths }}
+        run: |
+          EXC=(--exclude='.git/' --exclude='.git')
+          IFS=',' read -ra PATS <<< "$EXCLUDE"
+          for p in "${PATS[@]}"; do
+            p=$(echo "$p" | xargs)
+            [ -n "$p" ] && EXC+=(--exclude="$p")
+          done
+
+          # 1) الدمج الحرفي: كل ملف في Realme غير موجود في A15 يُنسخ بنفس المسار
+          rsync -a --ignore-existing --out-format='%n' "${EXC[@]}" "$DONOR_DIR"/ hybrid/ \
+            | grep -v '/$' > reports/added_files.txt || true
+          echo "عدد الملفات المضافة: $(wc -l < reports/added_files.txt)"
+
+          # 2) استبدال مسارات محددة اختيارياً بنسخة Realme
+          : > reports/overwritten_files.txt
+          IFS=',' read -ra OWS <<< "$OVERWRITE"
+          for p in "${OWS[@]}"; do
+            p=$(echo "$p" | xargs); p="${p%/}"
+            [ -n "$p" ] || continue
+            if [ -e "$DONOR_DIR/$p" ]; then
+              mkdir -p "hybrid/$(dirname "$p")"
+              rsync -a --out-format='%n' "$DONOR_DIR/$p" "hybrid/$(dirname "$p")/" \
+                | grep -v '/$' >> reports/overwritten_files.txt || true
+            else
+              echo "تحذير: $p غير موجود في Realme" | tee -a reports/overwritten_files.txt
+            fi
+          done
+          echo "عدد الملفات المستبدلة: $(wc -l < reports/overwritten_files.txt)"
+
+      - name: تقرير الدمج
+        run: |
+          F=reports/MERGE_REPORT.txt
+          {
+            echo "########## تقرير الدمج: Realme C15 -> Oppo A15 ##########"
+            echo "ملفات أُضيفت من Realme : $(wc -l < reports/added_files.txt)"
+            echo "ملفات استُبدلت          : $(grep -vc '^تحذير' reports/overwritten_files.txt || true)"
+            echo "إجمالي ملفات الهجين     : $(find hybrid -type f | wc -l)"
+            echo
+            echo "== أكثر المجلدات إضافةً =="
+            awk -F/ '{n=NF-1; if(n>3)n=3; s=$1; for(i=2;i<=n;i++) s=s"/"$i; print s}' reports/added_files.txt \
+              | sort | uniq -c | sort -rn | head -40
+            echo
+            echo "== إضافات تخص Oppo/Realme/اللمس =="
+            grep -i -E "oppo|realme|touchpanel|touchscreen|gesture" reports/added_files.txt | head -80
+            echo
+            echo "== ملفات أكبر من 50MB (GitHub يرفض الدفع فوق 100MB) =="
+            find hybrid -type f -size +50M -printf '%s bytes  %p\n' | head -20
+          } > "$F"
+          cat "$F"
+          cat "$F" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ضغط السورس الهجين
+        run: |
+          cd hybrid
+          zip -qr -1 ../hybrid-kernel-a15-c15.zip .
+          cd ..
+          ls -lh hybrid-kernel-a15-c15.zip
+
+      - name: رفع السورس الهجين (zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hybrid-kernel-source
+          path: hybrid-kernel-a15-c15.zip
+          compression-level: 0
+          retention-days: 7
+
+      - name: رفع تقرير الدمج
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-report
+          path: reports/
+
+      - name: دفع الهجين إلى مستودع جديد (اختياري)
+        if: ${{ inputs.target_repo != '' }}
+        env:
+          TARGET: ${{ inputs.target_repo }}
+          BRANCH: ${{ inputs.target_branch }}
+          TOKEN: ${{ secrets.PUSH_TOKEN }}
+        run: |
+          [ -n "$TOKEN" ] || { echo "::error::أضف السر PUSH_TOKEN (توكن بصلاحية repo) في إعدادات المستودع"; exit 1; }
+          cd hybrid
+          git init -q -b "$BRANCH"
+          git config user.name "hybrid-bot"
+          git config user.email "hybrid-bot@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          # -f لضمان إضافة ملفات يتجاهلها .gitignore (مثل .o_shipped أو مكتبات جاهزة)
+          git add -f -A
+          git commit -q -m "Hybrid kernel source: Oppo A15 + missing files from Realme C15"
+          AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" push -f "https://github.com/$TARGET.git" "HEAD:refs/heads/$BRANCH"
+          echo "تم الدفع إلى https://github.com/$TARGET (الفرع $BRANCH)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: نشر Release (اختياري)
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "hybrid-${{ github.run_id }}" hybrid-kernel-a15-c15.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Hybrid kernel source (A15 + C15)" \
+            --notes "Oppo A15 kernel-4.9 merged with the files it was missing from the Realme C15 source." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
