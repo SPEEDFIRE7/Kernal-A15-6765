@@ -1,0 +1,60 @@
+# ملف تكوين دمج أجزاء سورس أوبو A31 إلى A15
+project_name: "OPPO_A15_A31_Merge"
+target_device: "OPPO A15 (CPH2185)"
+donor_device: "OPPO A31 (CPH2015 / CPH2031)"
+soc_platform: "MT6765"
+
+# مسارات المجلدات الرئيسية (عدلها حسب مسارات العمل لديك)
+directories:
+  target_source: "workspace/OPPO_A15"
+  donor_source: "workspace/OPPO_A31"
+  output_dir: "workspace/merged_output"
+
+# الملفات والمكونات الأساسية المراد سحبها لتعويض النقص
+merge_actions:
+  
+  # 1. طبقة الـ Vendor ومكونات الهاردوير الخاصة بالمعالج والكاميرا
+  - type: "copy_missing"
+    description: "نسخ ملفات الـ Vendor الناقصة أو غير المتطابقة"
+    source_path: "donor_source/vendor"
+    target_path: "target_source/vendor"
+    exclude:
+      - "etc/vintf/manifest.xml"  # يتم التعامل معه بحذر لتجنب أخطاء البصمة
+      - "overlay"
+
+  # 2. ملفات النظام الأساسية والـ Framework (إذا كانت مفقودة وتؤدي لعدم الإقلاع)
+  - type: "merge_directory"
+    description: "دمج مكتبات النظام والـ Framework"
+    source_path: "donor_source/system/system/lib64"
+    target_path: "target_source/system/system/lib64"
+    policy: "skip_if_exists" # لا تقم بالكتابة فوق ملفات A15 الموجودة أصلاً لتجنب كسر البصمة الخاصة به
+
+  - type: "merge_directory"
+    description: "دمج مكتبات 32-bit الناقصة"
+    source_path: "donor_source/system/system/lib"
+    target_path: "target_source/system/system/lib"
+    policy: "skip_if_exists"
+
+  # 3. ملفات الإقلاع والـ Kernel / DTBO في حال احتاجها سورس A15
+  - type: "copy_file"
+    description: "نقل ملفات الـ dtbo و boot المعاونة إذا لزم الأمر"
+    files:
+      - from: "donor_source/dtbo.img"
+        to: "target_source/dtbo_donor.img"
+
+# إعدادات الـ Partition والصياغة النهائية لتفادي أخطاء الـ Super والـ FSTAB
+patch_configurations:
+  - target_file: "target_source/vendor/etc/fstab.mt6765"
+    action: "verify_mount_points"
+    note: "تأكد من مطابقة نقاط الإقلاع الخاصة بالـ userdata والـ metadata"
+
+  - target_file: "target_source/system/system/build.prop"
+    action: "append_properties"
+    properties:
+      - "ro.product.vendor.device=OPPO_A15"
+      - "ro.board.platform=mt6765"
+
+# أوامر ما بعد الدمج والتنظيف
+post_actions:
+  - "chmod -R 755 target_source/vendor/bin"
+  - "echo 'تم دمج الملفات الناقصة بنجاح، يرجى مراجعة سجل الأخطاء قبل بناء الـ Super.img'"
